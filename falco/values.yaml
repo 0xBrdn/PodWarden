@@ -1,0 +1,45 @@
+# Helm values for falcosecurity/falco
+# Driver: modern_ebpf (CO-RE, recommended)
+# Custom rules: PodWarden high-fidelity set
+# Output: Falcosidekick → PodWarden webhook
+
+driver:
+  kind: modern_ebpf
+  # modern_ebpf needs kernel >= 5.8 + BTF (Kind nodes satisfy this)
+
+# Collect Kubernetes metadata (namespace, pod, labels...)
+collectors:
+  enabled: true
+  kubernetes:
+    enabled: true
+
+# Force JSON output so Falcosidekick receives structured events
+falco:
+  json_output: true
+  json_include_output_property: true
+  http_output:
+    enabled: true
+    # Falcosidekick is co-located in the same release
+    url: "http://falco-falcosidekick:2801"
+
+# Load PodWarden custom rules into /etc/falco/rules.d/
+customRules:
+  podwarden_rules.yaml: |-
+    # (contenu identique à falco/podwarden_rules.yaml – embed pour Helm)
+    ... (règles complètes comme ci-dessus)
+
+# ---------------------------------------------------------------------------
+# Falcosidekick – forward alerts to PodWarden active-response controller
+# ---------------------------------------------------------------------------
+falcosidekick:
+  enabled: true
+  fullfqdn: false
+  config:
+    webhook:
+      address: "http://podwarden-responder.podwarden-system.svc.cluster.local:8080/webhook"
+      method: "POST"
+      # Authentication header expected by PodWarden
+      # Value should match the WEBHOOK_SECRET env var of the responder
+      customHeaders: "X-Webhook-Secret: CHANGE_ME_WITH_REAL_SECRET"
+      minimumpriority: "error"   # CRITICAL + ERROR only
+    debug: false

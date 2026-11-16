@@ -1,0 +1,112 @@
+# PodWarden high-fidelity custom rules
+# Target: application containers only (container.id != host)
+# Tag: podwarden
+# Priorities: CRITICAL / ERROR
+
+- list: podwarden_shell_binaries
+  items: [bash, sh, zsh, ash]
+
+- list: podwarden_recon_binaries
+  items: [curl, wget, nc, netcat, nmap, socat]
+
+- macro: podwarden_container
+  condition: container.id != host
+
+- macro: podwarden_spawned_process
+  condition: (evt.type in (execve, execveat) and evt.dir=<)
+
+# -----------------------------------------------------------------------------
+# 1. Interactive shell spawned inside an application container
+# -----------------------------------------------------------------------------
+- rule: PodWarden Interactive Shell Spawned
+  desc: >
+    An interactive shell (bash/sh/zsh/ash) was executed inside an application
+    container. This is a strong indicator of interactive compromise, debug
+    session abuse or container escape preparation.
+  condition: >
+    podwarden_spawned_process and
+    podwarden_container and
+    proc.name in (podwarden_shell_binaries)
+  output: >
+    PodWarden Interactive Shell Spawned
+    (user=%user.name user_uid=%user.uid
+     process=%proc.name proc_exepath=%proc.exepath
+     parent=%proc.pname cmdline=%proc.cmdline
+     container_id=%container.id container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s.ns=%k8s.ns.name k8s.pod=%k8s.pod.name)
+  priority: CRITICAL
+  tags: [podwarden, container, shell, mitre_execution, T1059]
+
+# -----------------------------------------------------------------------------
+# 2. Forbidden reconnaissance / network tooling
+# -----------------------------------------------------------------------------
+- rule: PodWarden Forbidden Recon Binary
+  desc: >
+    A reconnaissance or network utility (curl, wget, nc/netcat, nmap, socat)
+    was executed inside an application container. These binaries are rarely
+    required by production workloads and often indicate lateral movement,
+    C2 beaconing or data exfiltration preparation.
+  condition: >
+    podwarden_spawned_process and
+    podwarden_container and
+    proc.name in (podwarden_recon_binaries)
+  output: >
+    PodWarden Forbidden Recon Binary
+    (user=%user.name user_uid=%user.uid
+     process=%proc.name proc_exepath=%proc.exepath
+     parent=%proc.pname cmdline=%proc.cmdline
+     container_id=%container.id container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s.ns=%k8s.ns.name k8s.pod=%k8s.pod.name)
+  priority: CRITICAL
+  tags: [podwarden, container, recon, network, mitre_discovery, T1046, T1105]
+
+# -----------------------------------------------------------------------------
+# 3. Unauthorized access to Kubernetes ServiceAccount token
+# -----------------------------------------------------------------------------
+- rule: PodWarden K8s ServiceAccount Token Access
+  desc: >
+    A process inside an application container opened the projected ServiceAccount
+    token for reading. This is a high-signal indicator of credential theft and
+    potential privilege escalation / lateral movement inside the cluster.
+  condition: >
+    (evt.type in (open, openat, openat2) and evt.is_open_read=true and fd.typechar='f') and
+    podwarden_container and
+    fd.name = /var/run/secrets/kubernetes.io/serviceaccount/token and
+    not proc.name in (kubelet, containerd, crio, dockerd)
+  output: >
+    PodWarden K8s ServiceAccount Token Access
+    (user=%user.name user_uid=%user.uid
+     process=%proc.name proc_exepath=%proc.exepath
+     parent=%proc.pname cmdline=%proc.cmdline
+     file=%fd.name
+     container_id=%container.id container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s.ns=%k8s.ns.name k8s.pod=%k8s.pod.name)
+  priority: CRITICAL
+  tags: [podwarden, container, credential_access, k8s, mitre_credential_access, T1552]
+
+# -----------------------------------------------------------------------------
+# 4. Sensitive host/container file read
+# -----------------------------------------------------------------------------
+- rule: PodWarden Sensitive File Read
+  desc: >
+    A process inside an application container opened /etc/shadow or /etc/sudoers
+    for reading. These files contain highly sensitive authentication material
+    and should never be accessed by application workloads.
+  condition: >
+    (evt.type in (open, openat, openat2) and evt.is_open_read=true and fd.typechar='f') and
+    podwarden_container and
+    (fd.name = /etc/shadow or fd.name = /etc/sudoers)
+  output: >
+    PodWarden Sensitive File Read
+    (user=%user.name user_uid=%user.uid
+     process=%proc.name proc_exepath=%proc.exepath
+     parent=%proc.pname cmdline=%proc.cmdline
+     file=%fd.name
+     container_id=%container.id container_name=%container.name
+     image=%container.image.repository:%container.image.tag
+     k8s.ns=%k8s.ns.name k8s.pod=%k8s.pod.name)
+  priority: ERROR
+  tags: [podwarden, container, filesystem, credential_access, mitre_credential_access, T1003]
