@@ -1,3 +1,5 @@
+# Intentionally "vulnerable" workload: default ServiceAccount token mounted,
+# no NetworkPolicy, runs as root. It exists to be attacked by simulate_attack.sh.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,6 +21,8 @@ spec:
     spec:
       containers:
         - name: app
+          # Stock entrypoint on purpose: a custom `/bin/sh -c` entrypoint would
+          # look like an attacker to the shell rule at every pod start.
           image: nginx:1.25-alpine
           ports:
             - containerPort: 80
@@ -30,12 +34,6 @@ spec:
             limits:
               cpu: 100m
               memory: 64Mi
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              echo "vulnerable-app started – waiting for attack simulation"
-              apk add --no-cache wget curl >/dev/null 2>&1 || true
-              exec nginx -g 'daemon off;'
 ---
 apiVersion: v1
 kind: Service

@@ -1,12 +1,13 @@
 # Binaries
-bin/
+/bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-PodWarden
-podwarden
+/PodWarden
+/podwarden
+/pwverify
 
 # Test binary, built with `go test -c`
 *.test

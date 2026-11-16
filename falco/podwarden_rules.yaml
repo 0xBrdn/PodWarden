@@ -1,42 +1,78 @@
+# =============================================================================
+# PodWarden - high-fidelity detection rules
+# Every rule below is wired to an AUTOMATIC pod termination: keep them precise.
+# Run PodWarden with DRY_RUN=true first and tune before enforcing.
+# =============================================================================
+
+# Namespaces PodWarden never acts on (keep in sync with PROTECTED_NAMESPACES).
+- list: podwarden_excluded_namespaces
+  items: [kube-system, kube-public, kube-node-lease, podwarden-system, falco]
+
 - macro: podwarden_container
   condition: >
     (container.id != host and
-     k8s.ns.name != "kube-system" and
-     k8s.ns.name != "podwarden-system" and
-     k8s.ns.name != "falco")
+     not k8s.ns.name in (podwarden_excluded_namespaces))
 
+# Binaries that are allowed to read the ServiceAccount token (operators, CI
+# agents, controllers...). Add yours here instead of weakening the rule.
+# The placeholder keeps the list non-empty and never matches a real process.
+- list: podwarden_sa_token_allowed_procs
+  items: [podwarden_placeholder_never_matches]
+
+# ---------------------------------------------------------------------------
+# Execution - T1059.004 (Unix Shell)
+# A TTY is required: container entrypoints and scripts spawn non-interactive
+# shells all the time, and must not be killed at startup.
+# ---------------------------------------------------------------------------
 - rule: PodWarden Interactive Shell Spawned
-  desc: Detect interactive shell execution inside an application container
+  desc: Detect an interactive (TTY) shell started inside an application container
   condition: >
     spawned_process and podwarden_container and
-    proc.name in (bash, sh, zsh, ash, dash)
+    proc.name in (bash, sh, zsh, ash, dash) and
+    proc.tty != 0
   output: >
-    Interactive shell spawned (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name cmdline=%proc.cmdline container=%container.name image=%container.image.repository)
+    Interactive shell spawned (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name
+    container=%container.name cmdline=%proc.cmdline image=%container.image.repository)
   priority: ERROR
-  tags: [podwarden, container, shell]
+  tags: [podwarden, container, shell, mitre_execution, T1059.004]
 
+# ---------------------------------------------------------------------------
+# Command & Control / Discovery - T1105 (Ingress Tool Transfer), T1046
+# Heads-up: apps using curl/wget in exec probes or entrypoints will trigger this.
+# ---------------------------------------------------------------------------
 - rule: PodWarden Forbidden Recon Binary
-  desc: Detect execution of network reconnaissance or transfer tools inside a container
+  desc: Detect network reconnaissance or file-transfer tools executed in a container
   condition: >
     spawned_process and podwarden_container and
-    proc.name in (curl, wget, nc, netcat, nmap, socat)
+    proc.name in (curl, wget, nc, ncat, netcat, nmap, socat)
   output: >
-    Forbidden recon binary executed (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name proc=%proc.name cmdline=%proc.cmdline image=%container.image.repository)
+    Forbidden recon binary executed (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name
+    container=%container.name proc=%proc.name cmdline=%proc.cmdline image=%container.image.repository)
   priority: CRITICAL
-  tags: [podwarden, container, recon]
+  tags: [podwarden, container, recon, mitre_discovery, T1046, T1105]
 
+# ---------------------------------------------------------------------------
+# Credential Access - T1552.007 (Container API)
+# Any in-cluster client (operators, controllers) reads this token legitimately:
+# allow-list them in podwarden_sa_token_allowed_procs.
+# ---------------------------------------------------------------------------
 - rule: PodWarden K8s ServiceAccount Token Access
-  desc: Detect unauthorized read access to the Kubernetes ServiceAccount token
+  desc: Detect read access to the Kubernetes ServiceAccount token
   condition: >
     (evt.type in (open, openat, openat2) and evt.is_open_read=true and fd.typechar='f') and
     podwarden_container and
     fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount and
-    not proc.name in (kubelet, containerd, crio, dockerd)
+    not proc.name in (podwarden_sa_token_allowed_procs)
   output: >
-    K8s ServiceAccount token read (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name proc=%proc.name file=%fd.name cmdline=%proc.cmdline image=%container.image.repository)
+    K8s ServiceAccount token read (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name
+    container=%container.name proc=%proc.name file=%fd.name cmdline=%proc.cmdline
+    image=%container.image.repository)
   priority: CRITICAL
-  tags: [podwarden, container, credential_access, T1552]
+  tags: [podwarden, container, credential_access, mitre_credential_access, T1552.007]
 
+# ---------------------------------------------------------------------------
+# Credential Access - T1003.008 (/etc/passwd and /etc/shadow)
+# ---------------------------------------------------------------------------
 - rule: PodWarden Sensitive File Read
   desc: Detect read access to /etc/shadow or /etc/sudoers inside a container
   condition: >
@@ -44,10 +80,7 @@
     podwarden_container and
     fd.name in (/etc/shadow, /etc/sudoers)
   output: >
-    Sensitive file read (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name proc=%proc.name file=%fd.name image=%container.image.repository)
+    Sensitive file read (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name
+    container=%container.name proc=%proc.name file=%fd.name image=%container.image.repository)
   priority: CRITICAL
-  tags: [podwarden, container, credential_access]
-
-- rule: Drop and execute new binary in container
-  append: true
-  condition: and not (proc.name = mount and proc.pname = mount-product-f)
+  tags: [podwarden, container, credential_access, mitre_credential_access, T1003.008]

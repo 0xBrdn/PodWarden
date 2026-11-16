@@ -5,6 +5,9 @@ metadata:
   labels:
     app.kubernetes.io/name: podwarden
     app.kubernetes.io/component: system
+    # The responder is fully compliant with the "restricted" Pod Security Standard.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
 ---
 apiVersion: v1
 kind: Namespace

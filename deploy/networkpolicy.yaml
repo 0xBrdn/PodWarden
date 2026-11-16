@@ -1,0 +1,24 @@
+# Only Falcosidekick (namespace "falco") may talk to the responder.
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, recent kindnet...).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: podwarden-allow-falco-only
+  namespace: podwarden-system
+  labels:
+    app.kubernetes.io/name: podwarden
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: podwarden
+      app.kubernetes.io/component: responder
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: falco
+      ports:
+        - protocol: TCP
+          port: 8080

@@ -15,6 +15,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/0xBrdn/PodWarden/internal/config"
@@ -35,10 +37,46 @@ func newTestConfig(t *testing.T, dryRun bool) *config.Config {
 			"kube-system":      {},
 			"podwarden-system": {},
 		},
-		DryRun:      dryRun,
-		ListenAddr:  ":0",
-		IncidentDir: filepath.Join(tmpDir, "incidents"),
+		DryRun:       dryRun,
+		ListenAddr:   ":0",
+		IncidentDir:  filepath.Join(tmpDir, "incidents"),
+		DedupWindow:  30 * time.Second,
+		LogTailLines: 50,
 	}
+}
+
+// newMux wires a responder (writing incident lines nowhere) to the handler.
+func newMux(cfg *config.Config, cs kubernetes.Interface) *http.ServeMux {
+	responder := k8s.NewResponderWithClientset(cfg, newTestLogger(), cs)
+	responder.SetOutput(io.Discard)
+	mux := http.NewServeMux()
+	webhook.NewHandler(cfg, responder, newTestLogger()).Register(mux)
+	return mux
+}
+
+func post(mux *http.ServeMux, secret string, payload []byte) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(payload))
+	if secret != "" {
+		req.Header.Set("X-Webhook-Secret", secret)
+	}
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	return rr
+}
+
+func prodPod(name string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod-apps", UID: types.UID("uid-" + name)},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx:1.25-alpine"}},
+		},
+	}
+}
+
+func podExists(t *testing.T, cs kubernetes.Interface, name string) bool {
+	t.Helper()
+	_, err := cs.CoreV1().Pods("prod-apps").Get(context.Background(), name, metav1.GetOptions{})
+	return err == nil
 }
 
 func newTestLogger() *slog.Logger {
@@ -284,6 +322,159 @@ func TestHealthz(t *testing.T) {
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+}
+
+func TestMissingSecretHeaderIsUnauthorized(t *testing.T) {
+	cfg := newTestConfig(t, false)
+	mux := newMux(cfg, fake.NewSimpleClientset(prodPod("p1")))
+
+	rr := post(mux, "", makeFalcoPayload("r", "Critical", "prod-apps", "p1"))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rr.Code)
+	}
+}
+
+func TestAlertAndEmergencyPrioritiesAreActionable(t *testing.T) {
+	for _, prio := range []string{"Emergency", "Alert", "Critical", "Error"} {
+		t.Run(prio, func(t *testing.T) {
+			cfg := newTestConfig(t, false)
+			cs := fake.NewSimpleClientset(prodPod("p1"))
+			mux := newMux(cfg, cs)
+
+			rr := post(mux, testSecret, makeFalcoPayload("r", prio, "prod-apps", "p1"))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", rr.Code)
+			}
+			if podExists(t, cs, "p1") {
+				t.Fatalf("priority %s must trigger containment", prio)
+			}
+		})
+	}
+}
+
+func TestMalformedIdentityIsRejected(t *testing.T) {
+	cfg := newTestConfig(t, false)
+	mux := newMux(cfg, fake.NewSimpleClientset())
+
+	for _, pod := range []string{"../../etc/passwd", "UPPER", "a/b", "pod name"} {
+		rr := post(mux, testSecret, makeFalcoPayload("r", "Critical", "prod-apps", pod))
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("pod %q: expected 400, got %d", pod, rr.Code)
+		}
+	}
+	if entries, err := os.ReadDir(cfg.IncidentDir); err == nil && len(entries) != 0 {
+		t.Fatalf("no report may be written for rejected input, found %d", len(entries))
+	}
+}
+
+func TestMissingIdentityFieldsIsBadRequest(t *testing.T) {
+	cfg := newTestConfig(t, false)
+	mux := newMux(cfg, fake.NewSimpleClientset())
+
+	rr := post(mux, testSecret, makeFalcoPayload("r", "Critical", "", ""))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestInvalidJSONIsBadRequest(t *testing.T) {
+	cfg := newTestConfig(t, false)
+	mux := newMux(cfg, fake.NewSimpleClientset())
+
+	rr := post(mux, testSecret, []byte("{not json"))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestOversizedPayloadIsRejected(t *testing.T) {
+	cfg := newTestConfig(t, false)
+	mux := newMux(cfg, fake.NewSimpleClientset())
+
+	huge := bytes.Repeat([]byte("a"), (1<<20)+1024)
+	rr := post(mux, testSecret, huge)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", rr.Code)
+	}
+}
+
+func TestDuplicateAlertsProduceOneIncident(t *testing.T) {
+	cfg := newTestConfig(t, false)
+	cs := fake.NewSimpleClientset(prodPod("p1"))
+	mux := newMux(cfg, cs)
+	payload := makeFalcoPayload("r", "Critical", "prod-apps", "p1")
+
+	first := post(mux, testSecret, payload)
+	second := post(mux, testSecret, payload)
+
+	if !bytes.Contains(first.Body.Bytes(), []byte(`"processed"`)) {
+		t.Fatalf("first alert must be processed, got %s", first.Body.String())
+	}
+	if !bytes.Contains(second.Body.Bytes(), []byte(`"duplicate"`)) {
+		t.Fatalf("second alert must be flagged duplicate, got %s", second.Body.String())
+	}
+	entries, err := os.ReadDir(cfg.IncidentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 incident report, got %d", len(entries))
+	}
+}
+
+func TestCircuitBreakerKeepsEvidenceButSkipsDeletion(t *testing.T) {
+	cfg := newTestConfig(t, false)
+	cfg.MaxActionsPerMinute = 1
+	cs := fake.NewSimpleClientset(prodPod("p1"), prodPod("p2"))
+	mux := newMux(cfg, cs)
+
+	post(mux, testSecret, makeFalcoPayload("r", "Critical", "prod-apps", "p1"))
+	rr := post(mux, testSecret, makeFalcoPayload("r", "Critical", "prod-apps", "p2"))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if podExists(t, cs, "p1") {
+		t.Error("p1 should have been deleted (within budget)")
+	}
+	if !podExists(t, cs, "p2") {
+		t.Error("p2 must survive: circuit breaker is open")
+	}
+	if !bytes.Contains(rr.Body.Bytes(), []byte(k8s.ActionRateLimited)) {
+		t.Errorf("response should expose the skipped action, got %s", rr.Body.String())
+	}
+}
+
+func TestReportIsSignedAndVerifiable(t *testing.T) {
+	cfg := newTestConfig(t, false)
+	mux := newMux(cfg, fake.NewSimpleClientset(prodPod("p1")))
+	post(mux, testSecret, makeFalcoPayload("r", "Critical", "prod-apps", "p1"))
+
+	entries, err := os.ReadDir(cfg.IncidentDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected one report, err=%v n=%d", err, len(entries))
+	}
+	data, _ := os.ReadFile(filepath.Join(cfg.IncidentDir, entries[0].Name()))
+
+	ok, err := k8s.VerifyReport(data, testHMACKey)
+	if err != nil || !ok {
+		t.Fatalf("persisted report must verify: ok=%v err=%v", ok, err)
+	}
+	ok, _ = k8s.VerifyReport(bytes.Replace(data, []byte(`"deleted"`), []byte(`"dry-run"`), 1), testHMACKey)
+	if ok {
+		t.Fatal("edited report must not verify")
+	}
+}
+
+func TestReadyz(t *testing.T) {
+	cfg := newTestConfig(t, false)
+	mux := newMux(cfg, fake.NewSimpleClientset())
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
