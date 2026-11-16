@@ -64,6 +64,9 @@ spec:
             capabilities:
               drop:
                 - ALL
+          volumeMounts:
+            - name: incident-logs
+              mountPath: /var/log/podwarden
           livenessProbe:
             httpGet:
               path: /healthz
@@ -76,6 +79,9 @@ spec:
               port: http
             initialDelaySeconds: 3
             periodSeconds: 5
+      volumes:
+        - name: incident-logs
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

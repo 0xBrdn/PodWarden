@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vulnerable-app
+  namespace: prod-apps
+  labels:
+    app: vulnerable-app
+    environment: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vulnerable-app
+  template:
+    metadata:
+      labels:
+        app: vulnerable-app
+        environment: production
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "vulnerable-app started – waiting for attack simulation"
+              apk add --no-cache wget curl >/dev/null 2>&1 || true
+              exec nginx -g 'daemon off;'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vulnerable-app
+  namespace: prod-apps
+  labels:
+    app: vulnerable-app
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: vulnerable-app

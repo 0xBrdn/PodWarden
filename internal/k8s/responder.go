@@ -21,6 +21,8 @@ import (
 	"github.com/0xBrdn/PodWarden/internal/config"
 )
 
+// IncidentReport is the structured forensic artifact produced for every
+// actionable alert.
 type IncidentReport struct {
 	IncidentID    string            `json:"incident_id"`
 	Timestamp     time.Time         `json:"timestamp"`
@@ -34,20 +36,24 @@ type IncidentReport struct {
 	Labels        map[string]string `json:"labels,omitempty"`
 	Images        []string          `json:"images,omitempty"`
 	ContainerLogs string            `json:"container_logs,omitempty"`
-	Action        string            `json:"action"`
+	Action        string            `json:"action"` // "deleted" | "dry-run" | "skipped"
 	HMACSignature string            `json:"hmac_sha256"`
 	DryRun        bool              `json:"dry_run"`
 }
 
+// Responder encapsulates Kubernetes client interactions and incident handling.
 type Responder struct {
-	clientset *kubernetes.Clientset
+	clientset kubernetes.Interface
 	cfg       *config.Config
 	logger    *slog.Logger
 }
 
+// NewResponder builds a Kubernetes client (in-cluster first, then kubeconfig)
+// and returns a ready-to-use Responder.
 func NewResponder(cfg *config.Config, logger *slog.Logger) (*Responder, error) {
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
+		// Fallback for local development / Kind from host
 		kubeconfig := os.Getenv("KUBECONFIG")
 		if kubeconfig == "" {
 			kubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
@@ -66,9 +72,20 @@ func NewResponder(cfg *config.Config, logger *slog.Logger) (*Responder, error) {
 		return nil, fmt.Errorf("unable to create clientset: %w", err)
 	}
 
-	return &Responder{clientset: clientset, cfg: cfg, logger: logger}, nil
+	return NewResponderWithClientset(cfg, logger, clientset), nil
 }
 
+// NewResponderWithClientset is used by tests (and advanced callers) to inject
+// a kubernetes.Interface (e.g. fake.NewSimpleClientset).
+func NewResponderWithClientset(cfg *config.Config, logger *slog.Logger, cs kubernetes.Interface) *Responder {
+	return &Responder{
+		clientset: cs,
+		cfg:       cfg,
+		logger:    logger,
+	}
+}
+
+// HandleAlert performs the full active-response workflow for a validated alert.
 func (r *Responder) HandleAlert(ctx context.Context, rule, priority, output, namespace, podName string) error {
 	incidentID := fmt.Sprintf("pw-%s-%s", config.Now(), podName)
 
@@ -84,10 +101,13 @@ func (r *Responder) HandleAlert(ctx context.Context, rule, priority, output, nam
 		Action:     "pending",
 	}
 
+	// 1. Collect forensic metadata + logs
 	if err := r.collectForensics(ctx, report); err != nil {
 		r.logger.Warn("forensics collection partial failure", "error", err, "incident", incidentID)
+		// Continue – we still want to kill the pod even if logs are incomplete
 	}
 
+	// 2. Decide action
 	if r.cfg.DryRun {
 		report.Action = "dry-run"
 		r.logger.Info("DRY_RUN=true – pod will NOT be deleted", "pod", podName, "ns", namespace)
@@ -101,9 +121,16 @@ func (r *Responder) HandleAlert(ctx context.Context, rule, priority, output, nam
 		}
 	}
 
+	// 3. Sign the report
 	report.HMACSignature = r.sign(report)
 
-	return r.persist(report)
+	// 4. Persist + emit
+	if err := r.persist(report); err != nil {
+		r.logger.Error("failed to persist incident report", "error", err, "incident", incidentID)
+		return err
+	}
+
+	return nil
 }
 
 func (r *Responder) collectForensics(ctx context.Context, report *IncidentReport) error {
@@ -122,10 +149,14 @@ func (r *Responder) collectForensics(ctx context.Context, report *IncidentReport
 	}
 	report.Images = images
 
+	// Grab logs from the first container
 	if len(pod.Spec.Containers) > 0 {
 		containerName := pod.Spec.Containers[0].Name
 		tailLines := int64(50)
-		opts := &corev1.PodLogOptions{Container: containerName, TailLines: &tailLines}
+		opts := &corev1.PodLogOptions{
+			Container: containerName,
+			TailLines: &tailLines,
+		}
 		raw, err := r.clientset.CoreV1().Pods(report.Namespace).GetLogs(report.PodName, opts).Do(ctx).Raw()
 		if err != nil {
 			r.logger.Warn("unable to fetch container logs", "error", err, "container", containerName)
@@ -133,6 +164,7 @@ func (r *Responder) collectForensics(ctx context.Context, report *IncidentReport
 			report.ContainerLogs = string(raw)
 		}
 	}
+
 	return nil
 }
 
@@ -144,6 +176,7 @@ func (r *Responder) deletePod(ctx context.Context, namespace, name string) error
 }
 
 func (r *Responder) sign(report *IncidentReport) string {
+	// Canonical payload for signing (exclude the signature field itself)
 	payload := struct {
 		IncidentID string    `json:"incident_id"`
 		Timestamp  time.Time `json:"timestamp"`
@@ -161,6 +194,7 @@ func (r *Responder) sign(report *IncidentReport) string {
 		PodName:    report.PodName,
 		Action:     report.Action,
 	}
+
 	b, _ := json.Marshal(payload)
 	mac := hmac.New(sha256.New, []byte(r.cfg.HMACSigningKey))
 	mac.Write(b)
@@ -173,19 +207,21 @@ func (r *Responder) persist(report *IncidentReport) error {
 		return err
 	}
 
-	// Primary channel: structured JSON on stdout
+	// Always emit structured JSON on stdout (for log aggregators / SIEM)
 	fmt.Println(string(data))
 
-	// Best-effort disk write (non-fatal under read-only rootfs)
+	// Best-effort write to disk (may fail under read-only rootfs – that is OK)
 	if err := os.MkdirAll(r.cfg.IncidentDir, 0o750); err != nil {
 		r.logger.Warn("cannot create incident directory", "dir", r.cfg.IncidentDir, "error", err)
-		return nil
+		return nil // non-fatal
 	}
+
 	filename := filepath.Join(r.cfg.IncidentDir, report.IncidentID+".json")
 	if err := os.WriteFile(filename, data, 0o640); err != nil {
 		r.logger.Warn("cannot write incident file", "file", filename, "error", err)
-		return nil
+		return nil // non-fatal – stdout is the primary channel
 	}
+
 	r.logger.Info("incident report persisted", "file", filename, "signature", report.HMACSignature[:16]+"...")
 	return nil
 }
