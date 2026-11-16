@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podwarden-sa
+  namespace: podwarden-system
+  labels:
+    app.kubernetes.io/name: podwarden
+    app.kubernetes.io/component: responder
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podwarden-responder
+  labels:
+    app.kubernetes.io/name: podwarden
+    app.kubernetes.io/component: responder
+rules:
+  # Minimal privileges: only what is required for active response
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podwarden-responder
+  labels:
+    app.kubernetes.io/name: podwarden
+    app.kubernetes.io/component: responder
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: podwarden-responder
+subjects:
+  - kind: ServiceAccount
+    name: podwarden-sa
+    namespace: podwarden-system

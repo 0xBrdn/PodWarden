@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podwarden-system
+  labels:
+    app.kubernetes.io/name: podwarden
+    app.kubernetes.io/component: system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prod-apps
+  labels:
+    app.kubernetes.io/name: prod-apps
+    environment: production

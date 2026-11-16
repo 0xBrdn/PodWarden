@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podwarden-responder
+  namespace: podwarden-system
+  labels:
+    app.kubernetes.io/name: podwarden
+    app.kubernetes.io/component: responder
+    app.kubernetes.io/version: "0.1.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: podwarden
+      app.kubernetes.io/component: responder
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: podwarden
+        app.kubernetes.io/component: responder
+    spec:
+      serviceAccountName: podwarden-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: podwarden-responder
+          image: ghcr.io/0xbrdn/podwarden:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: podwarden-secrets
+                  key: webhook-secret
+                  optional: true
+            - name: HMAC_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: podwarden-secrets
+                  key: hmac-signing-key
+                  optional: true
+            - name: PROTECTED_NAMESPACES
+              value: "kube-system,podwarden-system"
+            - name: DRY_RUN
+              value: "false"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: podwarden-responder
+  namespace: podwarden-system
+  labels:
+    app.kubernetes.io/name: podwarden
+    app.kubernetes.io/component: responder
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: podwarden
+    app.kubernetes.io/component: responder
