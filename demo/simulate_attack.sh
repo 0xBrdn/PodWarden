@@ -74,7 +74,7 @@ done
 ELAPSED_MS=$(( $(now_ms) - START_MS ))
 
 if [[ "${KILLED}" == "true" ]]; then
-  info "Pod ${POD} terminated by PodWarden in ~${ELAPSED_MS} ms (attack -> pod gone) 🎉"
+  info "Pod ${POD} terminated by PodWarden in ~${ELAPSED_MS} ms (attack -> pod gone)"
 else
   error "Pod ${POD} still alive after ${TIMEOUT}s. Check: kubectl logs -n podwarden-system -l app.kubernetes.io/name=podwarden"
 fi
