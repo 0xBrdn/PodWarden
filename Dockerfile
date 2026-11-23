@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Stage 1 - build
-FROM golang:1.23-alpine AS builder
+FROM golang:1.27-alpine AS builder
 RUN apk add --no-cache git ca-certificates tzdata
 WORKDIR /src
 COPY go.mod go.sum ./
